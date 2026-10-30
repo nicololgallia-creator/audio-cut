@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0B0A0E">
+<title>Audio Cut</title>
+<meta name="description" content="Cut sound out of a video in your browser. Split, trim, reorder, shape and export clips. Nothing leaves your computer.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='26 2 77 99'%3E%3Cpath fill='%23F0E8DC' fill-rule='evenodd' d='M29 40 L30 15 L40 29 L47 5 L55 27 L66 11 L67 35 L79 44 L100 51 L79 58 L75 62 L71 86 L63 67 L61 98 L29 88 L36 62 Z M60 39 L65.5 45 L60 51 L54.5 45 Z'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="state-empty">
+
+<header class="bar">
+  <div class="lockup">
+    <svg viewBox="26 2 77 99" aria-hidden="true"><path fill-rule="evenodd" d="M29 40 L30 15 L40 29 L47 5 L55 27 L66 11 L67 35 L79 44 L100 51 L79 58 L75 62 L71 86 L63 67 L61 98 L29 88 L36 62 Z M60 39 L65.5 45 L60 51 L54.5 45 Z"/></svg>
+    <span>Audio Cut</span>
+  </div>
+  <div class="file" id="fileBox" hidden><b id="fileName" translate="no"></b><span id="fileFacts"></span></div>
+  <button class="btn small open tool" id="openBtn" type="button" hidden>Open Video</button>
+  <button class="btn small solid tool" id="exportBtn" type="button" hidden aria-keyshortcuts="E">Export <kbd>E</kbd></button>
+</header>
+
+<main class="empty" id="empty">
+  <canvas id="sun" aria-hidden="true"></canvas>
+  <div class="empty-copy">
+    <h1 id="emptyTitle">Cut the sound out of a video.</h1>
+    <p>Drop an mp4, mov or webm. The file stays on this computer.</p>
+  </div>
+  <div class="empty-act">
+    <button class="btn solid" id="chooseBtn" type="button">Choose a Video</button>
+    <p class="err" id="emptyErr" role="alert"></p>
+  </div>
+</main>
+
+<div class="loading" id="loading" hidden role="status">
+  <svg viewBox="26 2 77 99" aria-hidden="true"><path pathLength="1" d="M29 40 L30 15 L40 29 L47 5 L55 27 L66 11 L67 35 L79 44 L100 51 L79 58 L75 62 L71 86 L63 67 L61 98 L29 88 L36 62 Z"/></svg>
+  <div>Reading the audio in <b id="loadName" translate="no"></b>…</div>
+</div>
+
+<main class="work" id="work" hidden>
+  <section class="stage">
+    <aside class="bin" aria-label="Clips">
+      <div class="bin-head" id="binCount"></div>
+      <ol class="clip-list" id="clipList"></ol>
+    </aside>
+
+    <div class="view">
+      <div class="player" id="player">
+        <video id="video" aria-label="Video preview" muted playsinline preload="auto"></video>
+        <p id="noPicture" hidden>This browser can not show the picture. The audio still works.</p>
+      </div>
+      <div class="transport">
+        <div class="clock"><output id="phOut" aria-label="Playhead time"></output><span id="totalOut"></span></div>
+        <div class="play">
+          <button class="btn small tool" id="playBtn" type="button" aria-keyshortcuts="Space"></button>
+          <button class="btn small tool" id="playClipBtn" type="button" aria-keyshortcuts="S"></button>
+        </div>
+        <span></span>
+      </div>
+    </div>
+
+    <aside class="panel" aria-label="Clip settings">
+      <p class="none" id="noneMsg">Select a clip to edit it.</p>
+      <div class="panel-body" id="panelBody" hidden>
+        <div class="tabs" role="tablist" aria-label="Clip settings">
+          <button role="tab" type="button" id="tabClip" aria-controls="paneClip" aria-selected="true">Clip</button>
+          <button role="tab" type="button" id="tabSound" aria-controls="paneSound" aria-selected="false" tabindex="-1">Sound</button>
+          <button role="tab" type="button" id="tabFx" aria-controls="paneFx" aria-selected="false" tabindex="-1">Effects</button>
+        </div>
+
+        <div class="pane" id="paneClip" role="tabpanel" aria-labelledby="tabClip">
+          <label class="field">Name <input id="nameField" name="clip-name" autocomplete="off" spellcheck="false"></label>
+          <div class="times" id="timeRow">
+            <label class="field">Start <input id="startField" name="start" inputmode="decimal" autocomplete="off" spellcheck="false"></label>
+            <label class="field">End <input id="endField" name="end" inputmode="decimal" autocomplete="off" spellcheck="false"></label>
+          </div>
+          <p class="time-err" id="timeErr" role="alert" hidden></p>
+          <div class="len"><span>Length</span><output id="lenOut"></output></div>
+          <button class="btn tool" id="dupBtn" type="button" aria-keyshortcuts="Control+D">Duplicate</button>
+        </div>
+
+        <div class="pane" id="paneSound" role="tabpanel" aria-labelledby="tabSound" hidden>
+          <label class="ctl"><span>Volume</span><output data-for="gain"></output><input type="range" data-key="gain" min="-30" max="12" step="0.5" aria-label="Volume"></label>
+          <label class="ctl"><span>Fade In</span><output data-for="fadeIn"></output><input type="range" data-key="fadeIn" min="0" max="2" step="0.01" aria-label="Fade in"></label>
+          <label class="ctl"><span>Fade Out</span><output data-for="fadeOut"></output><input type="range" data-key="fadeOut" min="0" max="2" step="0.01" aria-label="Fade out"></label>
+          <label class="ctl"><span>Speed</span><output data-for="speed"></output><input type="range" data-key="speed" min="-2" max="2" step="0.05" aria-label="Speed"></label>
+          <div class="pair">
+            <label class="switch"><span>Reverse</span><input type="checkbox" data-key="reverse"></label>
+            <button class="btn small tool" id="normBtn" type="button">Normalize</button>
+          </div>
+        </div>
+
+        <div class="pane" id="paneFx" role="tabpanel" aria-labelledby="tabFx" hidden>
+          <label class="switch"><span>Reduce Noise</span><input type="checkbox" data-key="denoise"></label>
+          <label class="ctl"><span>Low Cut</span><output data-for="lowCut"></output><input type="range" data-key="lowCut" min="0" max="1" step="0.01" aria-label="Low cut"></label>
+          <label class="ctl"><span>High Cut</span><output data-for="highCut"></output><input type="range" data-key="highCut" min="0" max="1" step="0.01" aria-label="High cut"></label>
+          <label class="ctl"><span>Reverb</span><output data-for="reverb"></output><input type="range" data-key="reverb" min="0" max="1" step="0.01" aria-label="Reverb"></label>
+        </div>
+
+        <div class="foot" id="applyFoot" hidden><button class="btn tool" id="applyAllBtn" type="button">Apply to All Clips</button></div>
+      </div>
+    </aside>
+  </section>
+
+  <section class="tl" aria-label="Timeline">
+    <div class="tools" role="toolbar" aria-label="Edit tools">
+      <button class="ico tool" id="undoBtn" type="button" aria-label="Undo" title="Undo (Ctrl+Z)" aria-keyshortcuts="Control+Z"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3 2.5 6.5 6 10M3 6.5h6.5a3.5 3.5 0 0 1 0 7H7"/></svg></button>
+      <button class="ico tool" id="redoBtn" type="button" aria-label="Redo" title="Redo (Ctrl+Shift+Z)" aria-keyshortcuts="Control+Shift+Z"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3l3.5 3.5L10 10M13 6.5H6.5a3.5 3.5 0 0 0 0 7H9"/></svg></button>
+      <span class="tool-sep"></span>
+      <button class="ico tool" id="splitBtn" type="button" aria-label="Split at playhead" title="Split at playhead (Ctrl+B)" aria-keyshortcuts="Control+B"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5v13M2.5 4.5h3v7h-3M13.5 4.5h-3v7h3"/></svg></button>
+      <button class="ico tool" id="leftBtn" type="button" aria-label="Delete left of playhead" title="Delete left of playhead (Q)" aria-keyshortcuts="Q"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.5 2v12M3 5l5 6M8 5l-5 6"/></svg></button>
+      <button class="ico tool" id="rightBtn" type="button" aria-label="Delete right of playhead" title="Delete right of playhead (W)" aria-keyshortcuts="W"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 2v12M8 5l5 6M13 5l-5 6"/></svg></button>
+      <button class="ico tool" id="deleteBtn" type="button" aria-label="Delete clip" title="Delete clip (Delete)" aria-keyshortcuts="Delete"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5v-2h3v2M4.5 4.5l.7 9h5.6l.7-9"/></svg></button>
+      <span class="tool-sep"></span>
+      <button class="ico tool" id="markBtn" type="button" aria-label="Add marker" title="Add marker (M)" aria-keyshortcuts="M"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2h8v11.5l-4-3-4 3z"/></svg></button>
+      <button class="ico tool" id="snapBtn" type="button" aria-label="Snapping" title="Snapping (N)" aria-pressed="true" aria-keyshortcuts="N"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 2.5v6a4.5 4.5 0 0 0 9 0v-6h-3v6a1.5 1.5 0 0 1-3 0v-6z"/></svg></button>
+      <button class="btn small tool" id="autoBtn" type="button">Auto Split</button>
+      <div class="zoom">
+        <button class="btn small tool" id="zoomClip" type="button" aria-keyshortcuts="Z">Zoom to Clip</button>
+        <button class="btn small tool" id="zoomFit" type="button" aria-keyshortcuts="Shift+Z">Fit</button>
+        <input id="zoomRange" type="range" min="0" max="1" step="0.001" aria-label="Timeline zoom">
+      </div>
+    </div>
+    <div class="over" id="over" aria-hidden="true">
+      <canvas id="overCv"></canvas>
+      <div class="ov-win" id="ovWin"></div>
+      <div class="ov-ph" id="ovPh"></div>
+    </div>
+    <div class="main" id="main">
+      <canvas id="wave" role="img" aria-label="Timeline. Click a clip to select it, drag it to move it, double click a sound to cut it out, scroll to zoom."></canvas>
+      <div class="ph" id="ph"></div>
+      <div class="handle" id="hStart" role="slider" tabindex="0" aria-label="Trim clip start" hidden></div>
+      <div class="handle" id="hEnd" role="slider" tabindex="0" aria-label="Trim clip end" hidden></div>
+    </div>
+  </section>
+
+  <footer class="status">
+    <span id="status" aria-live="polite"></span>
+    <span class="keys">
+      <span aria-hidden="true"><kbd>Ctrl B</kbd>split</span>
+      <span aria-hidden="true"><kbd>Space</kbd>play</span>
+      <span aria-hidden="true"><kbd>S</kbd>play clip</span>
+      <button class="link tool" id="keysBtn" type="button">All Keys</button>
+    </span>
+  </footer>
+</main>
+
+<div class="cover" id="cover" hidden>Drop to open this video</div>
+
+<dialog id="exportDlg" aria-labelledby="exTitle">
+  <form id="exportForm" novalidate>
+    <h2 id="exTitle">Export audio</h2>
+    <div class="seg" id="exMode" role="radiogroup" aria-label="Files">
+      <label><input type="radio" name="exmode" value="one" checked>One File</label>
+      <label><input type="radio" name="exmode" value="each">Separate Files</label>
+    </div>
+    <div class="name-row">
+      <input class="text" id="exName" name="filename" aria-label="File name" autocomplete="off" spellcheck="false">
+      <div class="seg" role="radiogroup" aria-label="Format">
+        <label><input type="radio" name="fmt" value="wav" checked>.wav</label>
+        <label><input type="radio" name="fmt" value="mp3">.mp3</label>
+      </div>
+    </div>
+    <label class="switch" id="exSelRow"><span id="exSelText"></span><input type="checkbox" id="exSel"></label>
+    <p class="hint" id="exHint" role="status"></p>
+    <div class="acts">
+      <button class="btn" id="exCancel" type="button">Cancel</button>
+      <button class="btn solid" id="exSave" type="submit">Download</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="autoDlg" aria-labelledby="autoTitle">
+  <form id="autoForm" novalidate>
+    <h2 id="autoTitle">Split at the silences</h2>
+    <label class="ctl"><span>Quiet Below</span><output id="autoQuietOut"></output><input type="range" id="autoQuiet" min="-70" max="-12" step="1" aria-label="Quiet below"></label>
+    <label class="ctl"><span>Shortest Gap</span><output id="autoGapOut"></output><input type="range" id="autoGap" min="30" max="800" step="10" aria-label="Shortest gap"></label>
+    <label class="field">Name Clips <input class="text" id="autoPrefix" name="prefix" autocomplete="off" spellcheck="false"></label>
+    <label class="switch"><span>Delete the Silence</span><input type="checkbox" id="autoDrop" checked></label>
+    <p class="hint" id="autoHint" role="status"></p>
+    <div class="acts">
+      <button class="btn" id="autoCancel" type="button">Cancel</button>
+      <button class="btn solid" id="autoGo" type="submit">Split</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="keysDlg" aria-labelledby="keysTitle">
+  <h2 id="keysTitle">Keys</h2>
+  <dl class="keylist">
+    <dt><kbd>Space</kbd></dt><dd>Play or pause</dd>
+    <dt><kbd>S</kbd></dt><dd>Play the selected clip</dd>
+    <dt><kbd>Ctrl B</kbd></dt><dd>Split at the playhead</dd>
+    <dt><kbd>Q</kbd> <kbd>W</kbd></dt><dd>Delete left or right of the playhead</dd>
+    <dt><kbd>Delete</kbd></dt><dd>Delete the selected clips, closing the gap</dd>
+    <dt><kbd>Ctrl Z</kbd> <kbd>Ctrl Shift Z</kbd></dt><dd>Undo and redo</dd>
+    <dt><kbd>Ctrl A</kbd> <kbd>Ctrl D</kbd></dt><dd>Select all, duplicate</dd>
+    <dt><kbd>Up</kbd> <kbd>Down</kbd></dt><dd>Previous or next clip</dd>
+    <dt><kbd>Alt Left</kbd> <kbd>Alt Right</kbd></dt><dd>Move the selected clip earlier or later</dd>
+    <dt><kbd>Left</kbd> <kbd>Right</kbd></dt><dd>Step the playhead, hold Shift for one second</dd>
+    <dt><kbd>M</kbd> <kbd>N</kbd></dt><dd>Add a marker, turn snapping on or off</dd>
+    <dt><kbd>Z</kbd> <kbd>Shift Z</kbd></dt><dd>Zoom to the clip, fit the timeline</dd>
+    <dt><kbd>E</kbd></dt><dd>Export</dd>
+    <dt><kbd>Enter</kbd></dt><dd>In the Name field, save and move to the next clip</dd>
+    <dt>Double click</dt><dd>Cut the sound under the pointer out as its own clip</dd>
+    <dt>Scroll</dt><dd>Zoom. Hold Shift or Alt to move along the timeline</dd>
+  </dl>
+  <div class="acts"><button class="btn" id="keysClose" type="button">Close</button></div>
+</dialog>
+
+<video id="thumbVideo" muted playsinline preload="auto" hidden></video>
+<input id="fileInput" type="file" accept=".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm" hidden>
+
+<script src="lame.min.js"></script>
+<script src="js/sound.js"></script>
+<script src="js/sun.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
