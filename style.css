@@ -114,6 +114,8 @@ kbd {
 }
 .row span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--t-ink); }
 .row:hover { background: var(--t-surface); }
+.row.into { box-shadow: 0 -2px 0 var(--t-ember); }
+.row.into-end { box-shadow: 0 2px 0 var(--t-ember); }
 .row[aria-current="true"] { background: var(--t-raise); }
 .row[aria-current="true"] span:last-child { color: var(--t-sun); }
 .row:focus-visible { outline-offset: -2px; }
@@ -158,6 +160,7 @@ kbd {
 .time-err { margin: 0; color: var(--t-sun); }
 .len { display: flex; justify-content: space-between; align-items: baseline; color: var(--t-mute); }
 .len output { color: var(--t-sun); font-size: 15px; }
+.extract { width: 100%; min-height: 46px; margin-top: auto; justify-content: space-between; }
 .foot { padding: 8px 16px; border-top: 1px solid var(--t-line); }
 .pair { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: center; }
 .foot .btn { width: 100%; min-height: 34px; }
@@ -203,7 +206,7 @@ kbd {
 .over canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 .ov-win { position: absolute; top: 0; bottom: 0; border: 1px solid var(--t-ink); border-radius: 2px; pointer-events: none; }
 .ov-ph { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--t-ember); pointer-events: none; }
-.main { position: relative; margin: 6px 20px 0; touch-action: pan-y; cursor: default; user-select: none; }
+.main { position: relative; margin: 6px 20px 0; touch-action: pan-y; cursor: crosshair; user-select: none; }
 .main canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 .ph { position: absolute; top: 0; bottom: 0; left: 0; width: 2px; margin-left: -1px; background: var(--t-ember); pointer-events: none; will-change: transform; z-index: 2; }
 .ph::before { content: ""; position: absolute; left: -4px; top: 0; width: 10px; height: 12px; background: var(--t-ember); clip-path: polygon(0 0, 100% 0, 100% 60%, 50% 100%, 0 60%); }
@@ -286,6 +289,9 @@ dialog form { display: flex; flex-direction: column; gap: 14px; }
   .work, .stage { display: block; }
   .view { display: block; }
   .player { aspect-ratio: 16 / 9; }
+  .transport { grid-template-columns: 1fr auto; padding: 8px 16px; }
+  .transport > span { display: none; }
+  .clock span { display: none; }
   .panel { border-left: 0; border-top: 1px solid var(--t-line); }
   .pane { overflow: visible; }
   .tl { display: block; }

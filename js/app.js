@@ -1,6 +1,6 @@
-/* Audio Cut: the editor. A timeline of clips with no gaps, like a magnetic main
-   track. A clip is a window onto the source plus its settings, so editing never
-   changes the source and undo is cheap. */
+/* Audio Cut: the editor. The waveform is always the whole recording, and a clip
+   is a stretch of it you have marked, plus its settings. Cutting means dragging
+   across a sound. Nothing is ever chopped or moved, so undo is cheap. */
 (() => {
 "use strict";
 const $ = (s) => document.querySelector(s);
@@ -8,7 +8,7 @@ const { SR, clamp, clipLength, playLength, sourceAt } = Sound;
 const reduced = matchMedia("(prefers-reduced-motion: reduce)");
 const touch = matchMedia("(pointer: coarse)").matches;
 
-const MIN_CLIP = 0.01;   // shortest clip, in source seconds
+const MIN_CLIP = 0.01;   // shortest clip, in seconds
 const MIN_SPAN = 0.05;   // tightest zoom, in seconds
 const RULER = 24;
 
@@ -18,22 +18,20 @@ const ICON = {
 };
 const DEFAULTS = { gain: 0, fadeIn: 0, fadeOut: 0, speed: 1, reverse: false, denoise: false, lowCut: Sound.OFF_LOW, highCut: Sound.OFF_HIGH, reverb: 0 };
 
-let S = null;              // the open source: decoded audio, tables, thumbnails
-let clips = [];            // the timeline, in order
-let markers = [];          // timeline seconds
-let layout = [];           // { c, start, len } for each clip
-let total = 0;             // timeline length
+let S = null;              // the open recording: decoded audio, tables, thumbnails
+let clips = [];            // every marked stretch, in list order
+let markers = [];          // seconds
 let selected = new Set();  // clip ids
-let view = { s: 0, e: 1 }; // what the timeline shows
-let ph = 0;                // playhead, in timeline seconds
+let view = { s: 0, e: 1 }; // what the waveform shows
+let ph = 0;                // playhead, in seconds
 let snapOn = true;
 let past = [], future = [];
 let nextId = 1;
 let actx = null;
-let reveal = 1;            // 0 to 1 while the timeline first draws in
-let pin = null;            // keeps a trimmed clip's left edge under the hand during a drag
+let reveal = 1;            // 0 to 1 while the waveform first draws in
 let loadToken = 0;
 let saveKey = null;
+let lastName = "sfx_000";  // the next clip counts up from this
 
 const say = (text) => { $("#status").textContent = text; };
 
@@ -51,37 +49,40 @@ function parseTime(text) {
 }
 
 /* --- the model --- */
-const newClip = (a, b, name, from) => ({ ...DEFAULTS, ...from, id: nextId++, in: a, out: b, name });
+const newClip = (a, b, name, from) => ({ ...DEFAULTS, ...from, id: nextId++, in: a, out: b, name, draft: false });
 const byId = (id) => clips.find((c) => c.id === id);
 const only = () => (selected.size === 1 ? byId([...selected][0]) : null);
 const picks = () => clips.filter((c) => selected.has(c.id));
+const draftOf = () => clips.find((c) => c.draft);
 
-function relayout() {
-  let t = 0;
-  layout = clips.map((c) => {
-    const len = clipLength(c);
-    const start = t + (pin && pin.id === c.id ? pin.dt : 0);
-    t = start + len;
-    return { c, start, len };
-  });
-  total = t;
-}
-function at(t) {
-  let lo = 0, hi = layout.length - 1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1, r = layout[mid];
-    if (t < r.start) hi = mid - 1;
-    else if (t >= r.start + r.len) lo = mid + 1;
-    else return r;
-  }
+function clipAt(t) {
+  const on = only();
+  if (on && t >= on.in && t < on.out) return on;
+  for (let i = clips.length - 1; i >= 0; i--) if (t >= clips[i].in && t < clips[i].out) return clips[i];
   return null;
 }
-const rowOf = (c) => layout.find((r) => r.c === c);
+function placeByTime(c) {
+  clips = clips.filter((x) => x !== c);
+  const i = clips.findIndex((x) => x.in > c.in);
+  clips.splice(i < 0 ? clips.length : i, 0, c);
+}
+// the selection you are still working on: dragging again moves it instead of adding one
+function setDraft(a, b) {
+  let d = draftOf();
+  if (d) { d.in = a; d.out = b; }
+  else {
+    d = newClip(a, b, nextName(lastName), {});
+    d.draft = true;
+  }
+  placeByTime(d);
+  selected = new Set([d.id]);
+  return d;
+}
 
 function nextName(like, also = []) {
-  const m = (like || "sfx_000").match(/^(.*?)(\d+)$/);
+  const m = like.match(/^(.*?)(\d+)$/);
   const stem = m ? m[1] : `${like}_`, width = m ? m[2].length : 3;
-  let top = 0;
+  let top = m ? +m[2] : 0;
   for (const c of [...clips, ...also]) {
     if (c.name.startsWith(stem)) {
       const rest = c.name.slice(stem.length);
@@ -108,10 +109,6 @@ function commit(label, change) {
   settle(label);
 }
 function settle(label) {
-  relayout();
-  ph = clamp(ph, 0, total);
-  if (view.e - view.s > total && total > 0) view = { s: 0, e: total };
-  setView(view.s, view.e - view.s);
   buildList();
   syncAll();
   drawOver();
@@ -188,23 +185,21 @@ async function openFile(file) {
   const url = URL.createObjectURL(file);
   v.src = url;
 
-  saveKey = `audio-cut:v1:${file.name}:${file.size}:${file.lastModified}`;
-  past = []; future = []; markers = []; ph = 0; selected = new Set();
-  clips = [newClip(0, S.dur, "sfx_001")];
+  saveKey = `audio-cut:v2:${file.name}:${file.size}:${file.lastModified}`;
+  past = []; future = []; markers = []; ph = 0; selected = new Set(); clips = []; lastName = "sfx_000";
   let back = null;
   try { back = localStorage.getItem(saveKey); } catch {}
   if (back) {
     try { past.push(snapshot()); restore(back); } catch { past = []; }
   }
-  relayout();
-  view = { s: 0, e: Math.max(total, MIN_SPAN) };
+  view = { s: 0, e: S.dur };
   $("#fileName").textContent = file.name;
-  $("#fileFacts").textContent = `${SR / 1000} kHz  ${S.buffer.numberOfChannels > 1 ? "stereo" : "mono"}`;
+  $("#fileFacts").textContent = `${fmt(S.dur, false)}  ${SR / 1000} kHz  ${S.buffer.numberOfChannels > 1 ? "stereo" : "mono"}`;
   document.title = `${file.name} | Audio Cut`;
   showState("work");
   size();
-  if (clips.length === 1) select([clips[0].id]);
-  settle(back ? "Your last edit of this video is back. Ctrl+Z starts over." : `Press Auto Split to find every sound, or ${touch ? "double tap" : "double click"} one.`);
+  setView(0, S.dur);
+  settle(back ? "Your clips from last time are back. Ctrl+Z clears them." : `${touch ? "Drag" : "Drag"} across a sound to select it, then ${touch ? "tap Extract Audio" : "press E"}.`);
   setButtons();
   if (!reduced.matches) playReveal();
   makeThumbs(tv, url, token);
@@ -266,10 +261,11 @@ const waveCv = $("#wave"), wc = waveCv.getContext("2d");
 const overCv = $("#overCv"), oc = overCv.getContext("2d");
 const mainBox = $("#main"), overBox = $("#over");
 let mainW = 0, mainH = 0, overW = 0, overH = 0, dpr = 1, drawQueued = false, overQueued = false;
+let waveTop = 80;          // where the frames end and the waveform begins
 
 const pps = () => mainW / (view.e - view.s);
 const px = (t) => (t - view.s) * pps();
-const timeAt = (clientX) => clamp(view.s + (clientX - mainBox.getBoundingClientRect().left) / pps(), 0, total);
+const timeAt = (clientX) => clamp(view.s + (clientX - mainBox.getBoundingClientRect().left) / pps(), 0, S.dur);
 
 function size() {
   dpr = Math.min(devicePixelRatio || 1, 2);
@@ -285,37 +281,27 @@ new ResizeObserver(() => { if (S && !$("#work").hidden) size(); }).observe(mainB
 const curve = (v) => Math.sign(v) * Math.pow(Math.abs(v) / S.peak, 0.55);
 const pair = [0, 0];
 
-function bars(path, r, x1, perSec, top, height, stepPx, barPx, xmin, xmax) {
-  const c = r.c, mid = top + height / 2, half = height / 2 - 1;
-  const spp = stepPx / perSec * c.speed * SR, play = playLength(c);
-  const gain = clamp(Math.pow(10, c.gain / 20), 0, 2);
-  const startX = Math.max(xmin, x1 + ((Math.ceil((xmin - x1) / stepPx) * stepPx) || 0));
-  for (let x = startX; x < Math.min(xmax, x1 + play * perSec); x += stepPx) {
-    const u = (x - x1) / perSec;
-    const src = sourceAt(c, u);
-    const a = Math.max(0, Math.floor((c.reverse ? src - stepPx / perSec * c.speed : src) * SR));
-    const b = Math.min(S.mono.length, Math.ceil(a + spp));
-    if (b <= a) continue;
-    Sound.scan(S, a, b, spp, pair);
-    let k = gain;
-    if (c.fadeIn > 0 && u < c.fadeIn) k *= u / c.fadeIn;
-    if (c.fadeOut > 0 && play - u < c.fadeOut) k *= (play - u) / c.fadeOut;
-    const y1 = mid - curve(pair[1]) * half * k, y2 = mid - curve(pair[0]) * half * k;
-    path.rect(x, clamp(y1, top, top + height), barPx, Math.max(1, clamp(y2, top, top + height) - clamp(y1, top, top + height)));
-  }
+// the height a clip's settings give it at one moment, so fades and volume show
+function shape(c, t) {
+  const play = playLength(c), u = (c.reverse ? c.out - t : t - c.in) / c.speed;
+  let k = clamp(Math.pow(10, c.gain / 20), 0, 2);
+  if (c.fadeIn > 0 && u < c.fadeIn) k *= Math.max(0, u) / c.fadeIn;
+  if (c.fadeOut > 0 && play - u < c.fadeOut) k *= Math.max(0, play - u) / c.fadeOut;
+  return k;
 }
 
-function film(c, r, x1, x2, top, height, w) {
+function film(c, top, height, w) {
   const T = S.thumbs;
+  c.fillStyle = "#131118";
+  c.fillRect(0, top, w, height);
   if (!T) return;
   const tile = height * T.tw / T.th, perSec = pps();
-  const first = Math.max(x1, x1 + Math.floor((0 - x1) / tile) * tile);
-  for (let x = first; x < Math.min(x2, w); x += tile) {
-    const src = sourceAt(r.c, (x - x1) / perSec);
-    let i = clamp(Math.floor(src / S.dur * T.n), 0, T.n - 1);
+  const offset = view.s * perSec, first = Math.floor(offset / tile) * tile - offset;
+  for (let x = first; x < w; x += tile) {
+    const t = view.s + (x + tile / 2) / perSec;
+    let i = clamp(Math.floor(t / S.dur * T.n), 0, T.n - 1);
     while (i > 0 && !T.ready[i]) i--;
-    if (!T.ready[i]) continue;
-    c.drawImage(T.atlas, (i % T.cols) * T.tw, Math.floor(i / T.cols) * T.th, T.tw, T.th, x, top, tile, height);
+    if (T.ready[i]) c.drawImage(T.atlas, (i % T.cols) * T.tw, Math.floor(i / T.cols) * T.th, T.tw, T.th, x, top, tile, height);
   }
 }
 
@@ -351,60 +337,68 @@ function draw() {
   ruler(c, w);
 
   const top = RULER + 4, height = h - top - 2;
-  const filmH = clamp(Math.round(height * 0.3), 24, 54);
-  const waveTop = top + filmH + 2, waveH = height - filmH - 2;
-  const span = view.e - view.s, stepPx = span < 1 ? 2 : 3, barPx = span < 1 ? 1 : 2;
-  const quiet = new Path2D(), hot = new Path2D();
-  const limit = w * reveal;
+  const filmH = clamp(Math.round(height * 0.24), 22, 46);
+  waveTop = top + filmH + 2;
+  const waveH = h - waveTop - 2;
+  film(c, top, filmH, w);
 
-  for (const r of layout) {
-    const x1 = px(r.start), x2 = px(r.start + r.len);
+  // bands behind the sound
+  for (const clip of clips) {
+    const x1 = px(clip.in), x2 = px(clip.out);
     if (x2 < 0 || x1 > w) continue;
-    const on = selected.has(r.c.id), bw = Math.max(1, x2 - x1 - 1);
-    c.save();
-    c.beginPath(); c.roundRect(x1, top, bw, height, 3); c.clip();
-    c.fillStyle = on ? "#1E1A1C" : "#131118";
-    c.fillRect(x1, top, bw, height);
-    film(c, r, x1, x2, top, filmH, w);
-    bars(on ? hot : quiet, r, x1, perSec, waveTop, waveH, stepPx, barPx, Math.max(0, x1), Math.min(limit, x2 - 1));
-    c.restore();
+    const on = selected.has(clip.id);
+    c.fillStyle = on ? "rgba(248,200,112,.1)" : "rgba(240,232,220,.055)";
+    c.fillRect(x1, waveTop, x2 - x1, waveH);
+    if (on) { c.fillStyle = "rgba(248,200,112,.28)"; c.fillRect(x1, top, x2 - x1, filmH); }
+    else { c.fillStyle = "#4A4250"; c.fillRect(x1, waveTop, 1, waveH); c.fillRect(x2 - 1, waveTop, 1, waveH); }
+  }
+
+  // who owns each column of the waveform, with the selection on top
+  const span = view.e - view.s, stepPx = span < 1 ? 2 : 3, barPx = span < 1 ? 1 : 2;
+  const cols = Math.ceil(w / stepPx) + 1, owner = new Int32Array(cols).fill(-1);
+  const mark = (clip, i) => {
+    const a = Math.max(0, Math.floor(px(clip.in) / stepPx)), b = Math.min(cols - 1, Math.floor(px(clip.out) / stepPx));
+    for (let j = a; j <= b; j++) owner[j] = i;
+  };
+  clips.forEach((clip, i) => { if (!selected.has(clip.id)) mark(clip, i); });
+  clips.forEach((clip, i) => { if (selected.has(clip.id)) mark(clip, i); });
+
+  const quiet = new Path2D(), kept = new Path2D(), hot = new Path2D();
+  const mid = waveTop + waveH / 2, half = waveH / 2 - 1, spp = stepPx / perSec * SR, limit = w * reveal;
+  for (let i = 0; i < cols && i * stepPx < limit; i++) {
+    const x = i * stepPx, t = view.s + x / perSec;
+    const a = Math.max(0, Math.floor(t * SR)), b = Math.min(S.mono.length, Math.ceil(a + spp));
+    if (b <= a) continue;
+    Sound.scan(S, a, b, spp, pair);
+    const own = owner[i] >= 0 ? clips[owner[i]] : null;
+    const k = own ? shape(own, t) : 1;
+    const y1 = clamp(mid - curve(pair[1]) * half * k, waveTop, waveTop + waveH);
+    const y2 = clamp(mid - curve(pair[0]) * half * k, waveTop, waveTop + waveH);
+    (own ? (selected.has(own.id) ? hot : kept) : quiet).rect(x, y1, barPx, Math.max(1, y2 - y1));
   }
   c.fillStyle = "#8A8078"; c.fill(quiet);
+  c.fillStyle = "#F0E8DC"; c.fill(kept);
   c.fillStyle = "#F8C870"; c.fill(hot);
 
+  // names, drawn last so nothing covers them
   c.textBaseline = "top";
-  for (const r of layout) {
-    const x1 = px(r.start), x2 = px(r.start + r.len);
-    if (x2 < 0 || x1 > w) continue;
-    const on = selected.has(r.c.id), bw = Math.max(1, x2 - x1 - 1);
-    // fades, as a slope cut from the corners
-    const clipLeft = x1, clipRight = x1 + playLength(r.c) * perSec;
-    c.fillStyle = "rgba(11,10,14,.62)";
-    if (r.c.fadeIn > 0) { const fx = clipLeft + r.c.fadeIn * perSec; c.beginPath(); c.moveTo(clipLeft, top); c.lineTo(fx, top); c.lineTo(clipLeft, top + filmH); c.closePath(); c.fill(); }
-    if (r.c.fadeOut > 0) { const fx = clipRight - r.c.fadeOut * perSec; c.beginPath(); c.moveTo(clipRight, top); c.lineTo(fx, top); c.lineTo(clipRight, top + filmH); c.closePath(); c.fill(); }
-
-    c.strokeStyle = on ? "#F8C870" : "#2B2631";
-    c.lineWidth = on ? 2 : 1;
-    c.beginPath(); c.roundRect(x1 + (on ? 1 : 0.5), top + (on ? 1 : 0.5), Math.max(1, bw - (on ? 2 : 1)), height - (on ? 2 : 1), 3); c.stroke();
-
-    if (bw > 44) {
-      const tags = (r.c.speed !== 1 ? ` ${r.c.speed.toFixed(2)}x` : "") + (r.c.reverse ? " rev" : "");
-      const label = r.c.name + tags, x = Math.max(x1, 0) + 5;
-      c.save();
-      c.beginPath(); c.rect(x1, top, bw, height); c.clip();
-      const tw = c.measureText(label).width;
-      c.fillStyle = "rgba(11,10,14,.74)";
-      c.fillRect(x - 3, top + 3, tw + 6, 18);
-      c.fillStyle = "#F0E8DC";
-      c.fillText(label, x, top + 6);
-      c.restore();
-    }
-  }
-
-  if (drag && drag.kind === "clip" && drag.moved) {
-    const row = layout[drag.insert], x = px(row ? row.start : total);
-    c.fillStyle = "#F06B3C";
-    c.fillRect(x - 1, top, 3, height);
+  const rows = [];
+  for (const clip of clips) {
+    const x1 = px(clip.in), x2 = px(clip.out), bw = x2 - x1;
+    if (x2 < 0 || x1 > w || bw < 44) continue;
+    const tags = (clip.speed !== 1 ? ` ${clip.speed.toFixed(2)}x` : "") + (clip.reverse ? " rev" : "");
+    const label = clip.name + tags, x = Math.max(x1, 0) + 6, tw = c.measureText(label).width;
+    let row = 0;
+    while (rows[row] > x) row++;
+    rows[row] = x + tw + 10;
+    const y = waveTop + 4 + row * 21;
+    c.save();
+    c.beginPath(); c.rect(x1, waveTop, bw, waveH); c.clip();
+    c.fillStyle = "rgba(11,10,14,.74)";
+    c.fillRect(x - 3, y, tw + 6, 18);
+    c.fillStyle = selected.has(clip.id) ? "#F8C870" : "#F0E8DC";
+    c.fillText(label, x, y + 3);
+    c.restore();
   }
   place();
 }
@@ -418,17 +412,23 @@ function drawOver() {
   overQueued = true;
   requestAnimationFrame(() => {
     overQueued = false;
-    if (!S || !total) { oc.clearRect(0, 0, overCv.width, overCv.height); return; }
-    const c = oc, perSec = overW / total, path = new Path2D();
+    if (!S) return;
+    const c = oc, path = new Path2D(), spp = 2 * S.dur / overW * SR, mid = overH / 2, half = overH / 2 - 1;
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     c.clearRect(0, 0, overW, overH);
-    for (const r of layout) {
-      const x1 = r.start * perSec;
-      bars(path, r, x1, perSec, 0, overH, 2, 1, x1, x1 + r.len * perSec);
+    for (let x = 0; x < overW; x += 2) {
+      const a = Math.floor(x / overW * S.dur * SR), b = Math.min(S.mono.length, Math.ceil(a + spp));
+      if (b <= a) continue;
+      Sound.scan(S, a, b, spp, pair);
+      const y1 = mid - curve(pair[1]) * half, y2 = mid - curve(pair[0]) * half;
+      path.rect(x, y1, 1, Math.max(1, y2 - y1));
     }
     c.fillStyle = "#6E6660"; c.fill(path);
-    c.fillStyle = "#F8C870";
-    for (const r of layout) if (selected.has(r.c.id)) c.fillRect(r.start * perSec, overH - 3, Math.max(2, r.len * perSec), 3);
+    const perSec = overW / S.dur;
+    for (const clip of clips) {
+      c.fillStyle = selected.has(clip.id) ? "#F8C870" : "#F0E8DC";
+      c.fillRect(clip.in * perSec, overH - 3, Math.max(2, (clip.out - clip.in) * perSec), 3);
+    }
   });
 }
 function place() {
@@ -440,16 +440,14 @@ function place() {
   const c = only(), hS = $("#hStart"), hE = $("#hEnd");
   hS.hidden = hE.hidden = !c;
   if (c) {
-    const r = rowOf(c), a = px(r.start), b = px(r.start + r.len);
+    const a = px(c.in), b = px(c.out);
     hS.style.transform = `translateX(${a}px)`;
     hE.style.transform = `translateX(${b}px)`;
     hS.style.visibility = onScreen(a) ? "" : "hidden";
     hE.style.visibility = onScreen(b) ? "" : "hidden";
   }
-  if (total) {
-    $("#ovWin").style.cssText = `left:${view.s / total * 100}%;width:${Math.max(0.4, (view.e - view.s) / total * 100)}%`;
-    $("#ovPh").style.left = `${ph / total * 100}%`;
-  }
+  $("#ovWin").style.cssText = `left:${view.s / S.dur * 100}%;width:${Math.max(0.4, (view.e - view.s) / S.dur * 100)}%`;
+  $("#ovPh").style.left = `${ph / S.dur * 100}%`;
 }
 function playReveal() {
   const t0 = performance.now();
@@ -464,64 +462,52 @@ function playReveal() {
 
 /* --- the view --- */
 function setView(s, span) {
-  const end = Math.max(total, MIN_SPAN);
-  span = clamp(span, Math.min(MIN_SPAN, end), end);
+  const end = S.dur, floor = Math.min(MIN_SPAN, end);
+  span = clamp(span, floor, end);
   s = clamp(s, 0, end - span);
   view = { s, e: s + span };
-  const range = $("#zoomRange"), full = Math.log(end / Math.min(MIN_SPAN, end)) || 1;
-  range.value = 1 - Math.log(span / Math.min(MIN_SPAN, end)) / full;
+  $("#zoomRange").value = 1 - Math.log(span / floor) / (Math.log(end / floor) || 1);
   queueDraw();
 }
 function zoomAt(t, factor) {
-  const span = view.e - view.s, end = Math.max(total, MIN_SPAN);
-  const next = clamp(span * factor, Math.min(MIN_SPAN, end), end);
+  const span = view.e - view.s, next = clamp(span * factor, Math.min(MIN_SPAN, S.dur), S.dur);
   setView(t - (t - view.s) * (next / span), next);
 }
-const fit = () => setView(0, Math.max(total, MIN_SPAN));
+const fit = () => setView(0, S.dur);
 function keepInView(t) {
   const span = view.e - view.s;
   if (t < view.s || t > view.e) setView(t - span * 0.1, span);
 }
-function zoomToClip() {
+function zoomToSel() {
   const c = only() || picks()[0];
   if (!c) return;
-  const r = rowOf(c), pad = Math.max(r.len * 0.25, 0.02);
-  setView(r.start - pad, r.len + pad * 2);
+  const len = c.out - c.in, pad = Math.max(len * 0.25, 0.02);
+  setView(c.in - pad, len + pad * 2);
 }
 
 /* --- the clip list and inspector --- */
 const list = $("#clipList");
 function buildList() {
   list.textContent = "";
-  for (const r of layout) {
+  for (const c of clips) {
     const li = document.createElement("li"), row = document.createElement("button");
     const name = document.createElement("span"), len = document.createElement("span");
-    row.className = "row"; row.type = "button"; row.dataset.id = r.c.id;
-    row.setAttribute("aria-current", selected.has(r.c.id));
-    name.textContent = r.c.name;
+    row.className = "row"; row.type = "button"; row.dataset.id = c.id;
+    row.setAttribute("aria-current", selected.has(c.id));
+    name.textContent = c.name;
     name.translate = false;
-    len.textContent = `${r.len.toFixed(2)} s`;
+    len.textContent = `${clipLength(c).toFixed(2)} s`;
     row.append(name, len); li.append(row); list.append(li);
   }
   $("#binCount").textContent = clips.length === 1 ? "1 clip" : `${clips.length} clips`;
-  $("#totalOut").textContent = `/ ${fmt(total)}`;
+  $("#totalOut").textContent = `/ ${fmt(S.dur)}`;
 }
-list.addEventListener("click", (e) => {
-  const row = e.target.closest(".row");
-  if (!row) return;
-  const id = +row.dataset.id;
-  pick(id, e);
-  const c = byId(id);
-  if (c) { setPh(rowOf(c).start); keepInView(ph); }
-});
-list.addEventListener("dblclick", (e) => { if (e.target.closest(".row")) playClip(); });
-
 function select(ids) {
   selected = new Set(ids);
   syncAll();
   drawOver();
-  for (const row of list.children) {
-    const b = row.firstChild, on = selected.has(+b.dataset.id);
+  for (const li of list.children) {
+    const b = li.firstChild, on = selected.has(+b.dataset.id);
     b.setAttribute("aria-current", on);
     if (on && selected.size === 1) b.scrollIntoView({ block: "nearest" });
   }
@@ -539,6 +525,51 @@ function pick(id, e) {
   }
 }
 
+// a row can be clicked to select it, or dragged to change the order clips join in
+let rowDrag = null;
+list.addEventListener("pointerdown", (e) => {
+  const row = e.target.closest(".row");
+  if (!row || e.button !== 0) return;
+  rowDrag = { id: +row.dataset.id, y: e.clientY, moved: false, target: null, end: false, pointer: e.pointerId };
+});
+list.addEventListener("pointermove", (e) => {
+  if (!rowDrag) return;
+  if (!rowDrag.moved) {
+    if (Math.abs(e.clientY - rowDrag.y) < 6) return;
+    rowDrag.moved = true;
+    list.setPointerCapture(rowDrag.pointer);
+  }
+  list.querySelectorAll(".into, .into-end").forEach((r) => r.classList.remove("into", "into-end"));
+  const rows = [...list.querySelectorAll(".row")];
+  let target = rows.find((r) => { const b = r.getBoundingClientRect(); return e.clientY < b.top + b.height / 2; });
+  rowDrag.end = !target;
+  if (!target) target = rows[rows.length - 1];
+  rowDrag.target = +target.dataset.id;
+  target.classList.add(rowDrag.end ? "into-end" : "into");
+});
+list.addEventListener("pointerup", (e) => {
+  const d = rowDrag;
+  rowDrag = null;
+  if (!d) return;
+  list.querySelectorAll(".into, .into-end").forEach((r) => r.classList.remove("into", "into-end"));
+  if (d.moved) {
+    if (d.target === d.id) return;
+    commit("Clip moved.", () => {
+      const c = byId(d.id), rest = clips.filter((x) => x !== c);
+      const at = rest.findIndex((x) => x.id === d.target);
+      rest.splice(d.end ? rest.length : at, 0, c);
+      clips = rest;
+    });
+    return;
+  }
+  pick(d.id, e);
+  const c = byId(d.id);
+  if (c && selected.has(c.id)) { setPh(c.in); keepInView(c.in); }
+});
+list.addEventListener("pointercancel", () => { rowDrag = null; });
+list.addEventListener("dblclick", (e) => { if (e.target.closest(".row")) playClip(); });
+list.addEventListener("click", (e) => e.preventDefault());
+
 const log01 = (v, a, b) => a * Math.pow(b / a, v);
 const toLog = (hz, a, b) => Math.log(hz / a) / Math.log(b / a);
 const CONTROLS = {
@@ -551,15 +582,14 @@ const CONTROLS = {
   reverb: { show: (v) => (v ? `${Math.round(v * 100)}%` : "Off") },
 };
 
+let sliding = null;
 function syncAll() {
   const c = only(), first = c || picks()[0], some = !!first;
   $("#noneMsg").hidden = some;
   $("#panelBody").hidden = !some;
-  $("#noneMsg").textContent = clips.length ? "Select a clip to edit it." : "The timeline is empty. Press Ctrl+Z to bring it back.";
-  for (const id of ["#splitBtn", "#leftBtn", "#rightBtn"]) $(id).disabled = !clips.length;
+  $("#noneMsg").textContent = "Drag across the waveform to select a sound.";
+  $("#splitBtn").disabled = !c;
   $("#deleteBtn").disabled = !some;
-  $("#exportBtn").disabled = !clips.length;
-  $("#autoBtn").disabled = !clips.length;
   $("#undoBtn").disabled = !past.length;
   $("#redoBtn").disabled = !future.length;
   $("#zoomClip").disabled = !some;
@@ -570,14 +600,14 @@ function syncAll() {
     if (document.activeElement !== name) name.value = c ? c.name : `${selected.size} clips selected`;
     name.disabled = !c;
     $("#timeRow").hidden = !c;
+    $("#extractBtn").hidden = !c;
     if (c) {
       if (document.activeElement !== startF) { startF.value = fmt(c.in); startF.removeAttribute("aria-invalid"); }
       if (document.activeElement !== endF) { endF.value = fmt(c.out); endF.removeAttribute("aria-invalid"); }
       $("#lenOut").textContent = `${clipLength(c).toFixed(3)} s`;
-      const r = rowOf(c);
-      for (const [el, t, word] of [[$("#hStart"), r.start, "start"], [$("#hEnd"), r.start + r.len, "end"]]) {
+      for (const [el, t, word] of [[$("#hStart"), c.in, "start"], [$("#hEnd"), c.out, "end"]]) {
         el.setAttribute("aria-valuemin", "0");
-        el.setAttribute("aria-valuemax", total.toFixed(3));
+        el.setAttribute("aria-valuemax", S.dur.toFixed(3));
         el.setAttribute("aria-valuenow", t.toFixed(3));
         el.setAttribute("aria-valuetext", `${word} ${fmt(t)}`);
       }
@@ -617,7 +647,6 @@ tabs.forEach((t, i) => {
 });
 
 // sliders and switches change every selected clip
-let sliding = null;
 for (const input of document.querySelectorAll("[data-key]")) {
   const key = input.dataset.key, ctl = CONTROLS[key];
   if (input.type === "checkbox") {
@@ -630,7 +659,6 @@ for (const input of document.querySelectorAll("[data-key]")) {
     if (!sliding) { halt(); sliding = snapshot(); }
     const v = ctl.read ? ctl.read(+input.value) : +input.value;
     for (const c of picks()) c[key] = v;
-    relayout();
     syncAll();
   });
   input.addEventListener("change", () => {
@@ -645,11 +673,11 @@ for (const input of document.querySelectorAll("[data-key]")) {
 }
 
 $("#normBtn").onclick = async () => {
-  const list = picks();
+  const chosen = picks();
   say("Measuring…");
   const gains = [];
-  for (const c of list) gains.push(await Sound.normalGain(S, c));
-  commit("Loudest point set to -1 dB.", () => list.forEach((c, i) => { c.gain = gains[i]; }));
+  for (const c of chosen) gains.push(await Sound.normalGain(S, c));
+  commit("Loudest point set to -1 dB.", () => chosen.forEach((c, i) => { c.gain = gains[i]; }));
 };
 $("#applyAllBtn").onclick = () => {
   const from = only() || picks()[0];
@@ -661,16 +689,17 @@ $("#applyAllBtn").onclick = () => {
   });
 };
 function duplicate() {
-  const list = picks();
-  if (!list.length) return;
-  commit("Duplicated.", () => {
+  const chosen = picks();
+  if (!chosen.length) return;
+  commit("Duplicated. Change its settings to make a variation.", () => {
     const made = [];
-    for (const c of list) {
-      const copy = newClip(c.in, c.out, nextName(c.name), c);
+    for (const c of chosen) {
+      const copy = newClip(c.in, c.out, nextName(c.name, made), c);
+      c.draft = false;
       clips.splice(clips.indexOf(c) + 1, 0, copy);
-      made.push(copy.id);
+      made.push(copy);
     }
-    selected = new Set(made);
+    selected = new Set(made.map((c) => c.id));
   });
 }
 $("#dupBtn").onclick = duplicate;
@@ -678,7 +707,9 @@ $("#dupBtn").onclick = duplicate;
 const nameField = $("#nameField");
 function saveName() {
   const c = only(), name = Sound.cleanName(nameField.value);
-  if (c && name && name !== c.name) commit(null, () => { c.name = name; });
+  if (!c || !name) return;
+  if (name !== c.name || c.draft) commit(null, () => { c.name = name; c.draft = false; });
+  lastName = name;
 }
 nameField.addEventListener("change", saveName);
 nameField.addEventListener("keydown", (e) => {
@@ -687,14 +718,13 @@ nameField.addEventListener("keydown", (e) => {
   e.preventDefault();
   saveName();
   // name, Enter, and the next sound plays, so a long list goes quickly
-  const i = clips.indexOf(only());
-  const next = clips[i + 1];
+  const next = clips[clips.indexOf(only()) + 1];
   if (!next) { nameField.blur(); return say("That was the last clip."); }
   select([next.id]);
   nameField.value = next.name;
   nameField.select();
-  setPh(rowOf(next).start);
-  keepInView(ph);
+  setPh(next.in);
+  keepInView(next.in);
   playClip();
 });
 nameField.addEventListener("focus", () => nameField.select());
@@ -709,10 +739,13 @@ function commitTime(el, key) {
   }
   el.removeAttribute("aria-invalid");
   const c = only();
-  if (c) commit(null, () => {
+  if (!c || Math.abs(c[key] - t) < 0.0005) return true;
+  commit(null, () => {
     if (key === "in") c.in = clamp(t, 0, c.out - MIN_CLIP);
     else c.out = clamp(t, c.in + MIN_CLIP, S.dur);
   });
+  setPh(c[key]);
+  keepInView(c[key]);
   return true;
 }
 for (const [id, key] of [["#startField", "in"], ["#endField", "out"]]) {
@@ -729,86 +762,44 @@ for (const [id, key] of [["#startField", "in"], ["#endField", "out"]]) {
 }
 
 /* --- edits --- */
-function clipUnderPlayhead() {
+function setEdge(key) {
   const c = only();
-  if (c) { const r = rowOf(c); if (ph >= r.start && ph <= r.start + r.len) return r; }
-  return at(Math.min(ph, Math.max(0, total - 1e-6)));
+  if (!c) {
+    const a = key === "in" ? ph : Math.max(0, ph - 1), b = key === "in" ? Math.min(S.dur, ph + 1) : ph;
+    if (b - a < MIN_CLIP) return;
+    return commit("Selection made. Press E to extract it.", () => setDraft(a, b));
+  }
+  if (key === "in" ? ph >= c.out - MIN_CLIP : ph <= c.in + MIN_CLIP) return say("Move the playhead inside the selection first.");
+  commit(key === "in" ? "Start set." : "End set.", () => { c[key] = ph; });
 }
 function split() {
-  const r = clipUnderPlayhead();
-  if (!r) return;
-  const c = r.c, u = ph - r.start, cut = u * c.speed;
-  if (cut < MIN_CLIP || (c.out - c.in) - cut < MIN_CLIP) return say("Move the playhead inside a clip to split it.");
+  const c = only() || clipAt(ph);
+  if (!c) return say("Select something to split first.");
+  if (ph - c.in < MIN_CLIP || c.out - ph < MIN_CLIP) return say("Move the playhead inside the selection to split it.");
   commit("Split.", () => {
-    const right = newClip(0, 0, nextName(c.name), c);
-    if (c.reverse) { right.in = c.in; right.out = c.out - cut; c.in = c.out - cut; }
-    else { right.in = c.in + cut; right.out = c.out; c.out = c.in + cut; }
-    right.fadeIn = 0; c.fadeOut = 0;
+    const right = newClip(ph, c.out, nextName(c.name), { ...c, fadeIn: 0 });
+    c.out = ph; c.fadeOut = 0; c.draft = false;
     clips.splice(clips.indexOf(c) + 1, 0, right);
     selected = new Set([right.id]);
-  });
-}
-function trimLeft() {
-  const r = clipUnderPlayhead();
-  if (!r) return;
-  const c = r.c, cut = (ph - r.start) * c.speed;
-  if (cut < MIN_CLIP || (c.out - c.in) - cut < MIN_CLIP) return say("Move the playhead inside a clip first.");
-  const start = r.start;
-  commit("Deleted left of the playhead.", () => {
-    if (c.reverse) c.out -= cut; else c.in += cut;
-    ph = start;
-  });
-}
-function trimRight() {
-  const r = clipUnderPlayhead();
-  if (!r) return;
-  const c = r.c, keep = (ph - r.start) * c.speed;
-  if (keep < MIN_CLIP || (c.out - c.in) - keep < MIN_CLIP) return say("Move the playhead inside a clip first.");
-  commit("Deleted right of the playhead.", () => {
-    if (c.reverse) c.in = c.out - keep; else c.out = c.in + keep;
   });
 }
 function remove() {
   const gone = selected;
   if (!gone.size) return;
   const after = clips.find((c, i) => !gone.has(c.id) && i > clips.findIndex((x) => gone.has(x.id)));
-  commit(gone.size === 1 ? "Clip deleted." : `${gone.size} clips deleted.`, () => {
+  commit(gone.size === 1 ? "Deleted. The recording is untouched." : `${gone.size} clips deleted. The recording is untouched.`, () => {
     clips = clips.filter((c) => !gone.has(c.id));
-    selected = new Set(after ? [after.id] : clips.length ? [clips[clips.length - 1].id] : []);
+    selected = new Set(after ? [after.id] : []);
   });
 }
-function isolate(t) {
-  const r = at(t);
-  if (!r) return;
-  const c = r.c;
-  if (c.reverse) return say("Turn off Reverse on this clip to cut a sound out of it.");
-  const hit = Sound.soundAround(S, sourceAt(c, t - r.start));
+// double click takes the whole sound under the pointer
+function pickSound(t) {
+  const there = clipAt(t);
+  if (there) { select([there.id]); setPh(there.in); return playClip(); }
+  const hit = Sound.soundAround(S, t);
   if (!hit) return say("No sound near there.");
-  const s = Math.max(hit.s, c.in), e = Math.min(hit.e, c.out);
-  if (s - c.in < MIN_CLIP && c.out - e < MIN_CLIP) {
-    select([c.id]); setPh(r.start);
-    return playClip();
-  }
-  let mid;
-  commit("Sound cut out. Name it, or press Delete.", () => {
-    const from = c.in, to = c.out, fadeOut = c.fadeOut, ranges = [];
-    if (s - from >= MIN_CLIP) ranges.push([from, s]);
-    const midAt = ranges.length;
-    ranges.push([s, e]);
-    if (to - e >= MIN_CLIP) ranges.push([e, to]);
-    const made = [];
-    ranges.forEach(([a, b], i) => {
-      if (i === 0) { c.in = a; c.out = b; made.push(c); return; }
-      const piece = newClip(a, b, nextName(c.name, made), c);
-      piece.fadeIn = 0;
-      made.push(piece);
-    });
-    made.forEach((p, i) => { if (i < made.length - 1) p.fadeOut = 0; else p.fadeOut = fadeOut; });
-    clips.splice(clips.indexOf(c), 1, ...made);
-    mid = made[midAt];
-    selected = new Set([mid.id]);
-  });
-  setPh(rowOf(mid).start);
+  commit(touch ? "Sound selected." : "Sound selected. Press E to extract it.", () => setDraft(hit.s, hit.e));
+  setPh(hit.s);
   playClip();
 }
 function marker() {
@@ -823,41 +814,38 @@ function toggleSnap() {
   say(snapOn ? "Snapping on." : "Snapping off.");
 }
 function jump(dir) {
-  const i = clips.indexOf(only() || (at(ph) || {}).c);
-  const next = clips[clamp(i + dir, 0, clips.length - 1)];
-  if (!next) return;
+  if (!clips.length) return;
+  const i = clips.indexOf(only());
+  const next = clips[i < 0 ? 0 : clamp(i + dir, 0, clips.length - 1)];
   select([next.id]);
-  setPh(rowOf(next).start);
-  keepInView(ph);
+  setPh(next.in);
+  keepInView(next.in);
 }
-
 function nudge(dir) {
-  const list = picks();
-  if (!list.length || list.length === clips.length) return;
-  const rest = clips.filter((c) => !selected.has(c.id));
-  const first = clips.indexOf(list[0]), to = clamp(first + dir, 0, rest.length);
-  if (to === first) return;
-  commit("Clip moved.", () => { rest.splice(to, 0, ...list); clips = rest; });
-  keepInView(rowOf(list[0]).start);
+  const c = only();
+  if (!c) return;
+  const i = clips.indexOf(c), to = clamp(i + dir, 0, clips.length - 1);
+  if (to === i) return;
+  commit("Clip moved.", () => { clips.splice(i, 1); clips.splice(to, 0, c); });
 }
 
 $("#undoBtn").onclick = undo;
 $("#redoBtn").onclick = redo;
+$("#leftBtn").onclick = () => setEdge("in");
+$("#rightBtn").onclick = () => setEdge("out");
 $("#splitBtn").onclick = split;
-$("#leftBtn").onclick = trimLeft;
-$("#rightBtn").onclick = trimRight;
 $("#deleteBtn").onclick = remove;
 $("#markBtn").onclick = marker;
 $("#snapBtn").onclick = toggleSnap;
 $("#zoomFit").onclick = fit;
-$("#zoomClip").onclick = zoomToClip;
+$("#zoomClip").onclick = zoomToSel;
 $("#zoomRange").addEventListener("input", (e) => {
-  const end = Math.max(total, MIN_SPAN), floor = Math.min(MIN_SPAN, end);
-  const span = floor * Math.pow(end / floor, 1 - +e.target.value), t = clamp(ph, view.s, view.e);
+  const floor = Math.min(MIN_SPAN, S.dur), span = floor * Math.pow(S.dur / floor, 1 - +e.target.value);
+  const t = clamp(ph, view.s, view.e);
   setView(t - (t - view.s) * (span / (view.e - view.s)), span);
 });
 
-/* --- playback: sound from the renderer, so it is exact; the video follows, muted --- */
+/* --- playback: sound from Web Audio, so it is exact; the video follows, muted --- */
 let voice = null, playToken = 0;
 const video = $("#video");
 let seekWanted = null;
@@ -870,64 +858,69 @@ video.addEventListener("seeked", () => {
   const t = seekWanted; seekWanted = null;
   video.currentTime = t;
 });
-function showFrame(t) {
-  const r = at(Math.min(t, Math.max(0, total - 1e-6)));
-  if (r) seekVideo(sourceAt(r.c, t - r.start));
-}
 function setPh(t) {
-  ph = clamp(t, 0, total);
-  showFrame(ph);
+  ph = clamp(t, 0, S.dur);
+  seekVideo(ph);
   $("#phOut").textContent = fmt(ph);
   place();
 }
 function setButtons() {
   const on = !!voice;
   $("#playBtn").innerHTML = (on && voice.mode === "free" ? ICON.stop + "Pause" : ICON.play + "Play") + " <kbd>Space</kbd>";
-  $("#playClipBtn").innerHTML = (on && voice.mode === "clip" ? ICON.stop + "Stop" : ICON.play + "Clip") + " <kbd>S</kbd>";
+  $("#playClipBtn").innerHTML = (on && voice.mode === "clip" ? ICON.stop + "Stop" : ICON.play + "Selection") + " <kbd>S</kbd>";
 }
-async function play(from, to, mode) {
-  halt();
-  if (to - from < 0.001) return;
-  const token = ++playToken;
-  const parts = layout.filter((r) => r.start + r.len > from && r.start < to);
-  const slow = setTimeout(() => say("Preparing…"), 200);
-  const sounds = [];
-  for (const r of parts) sounds.push(await Sound.render(S, r.c));
-  clearTimeout(slow);
-  if (token !== playToken) return;
+function start(buffer, offset, spec) {
   actx.resume();
+  const node = actx.createBufferSource();
+  node.buffer = buffer;
+  node.connect(actx.destination);
   const t0 = actx.currentTime + 0.05;
-  const nodes = parts.map((r, i) => {
-    const node = actx.createBufferSource();
-    node.buffer = sounds[i];
-    node.connect(actx.destination);
-    node.start(t0 + Math.max(0, r.start - from), Math.max(0, from - r.start), Math.min(r.start + r.len, to) - Math.max(r.start, from));
-    return node;
-  });
-  voice = { nodes, from, to, t0, mode, row: null };
+  node.start(t0, offset);
+  voice = { node, t0, ...spec };
   setButtons();
   requestAnimationFrame(tick);
 }
+function playFree() {
+  halt();
+  const from = ph >= S.dur - 0.01 ? 0 : ph;
+  video.playbackRate = 1;
+  seekVideo(from);
+  video.play().catch(() => {});
+  start(S.buffer, from, { mode: "free", from, to: S.dur });
+}
+async function playClip() {
+  const c = only() || clipAt(ph);
+  if (!c) return;
+  halt();
+  const token = ++playToken;
+  const slow = setTimeout(() => say("Preparing…"), 200);
+  const sound = await Sound.render(S, c);
+  clearTimeout(slow);
+  if (token !== playToken) return;
+  start(sound, 0, { mode: "clip", c, to: sound.duration });
+}
 function tick() {
   if (!voice) return;
-  const t = clamp(voice.from + actx.currentTime - voice.t0, voice.from, voice.to);
-  ph = t;
-  if (t >= voice.to) return finish();
-  const r = at(t);
-  if (r) {
-    const want = sourceAt(r.c, t - r.start), moved = r !== voice.row;
-    voice.row = r;
-    if (r.c.reverse) {
+  const u = actx.currentTime - voice.t0;
+  if (voice.mode === "free") {
+    ph = clamp(voice.from + u, 0, S.dur);
+    if (ph >= voice.to) return finish();
+    if (Math.abs(video.currentTime - ph) > 0.25 && !video.seeking) video.currentTime = ph;
+  } else {
+    if (u >= voice.to) return finish();
+    const c = voice.c;
+    ph = sourceAt(c, Math.max(0, u));
+    if (c.reverse) {
       if (!video.paused) video.pause();
-      if (Math.abs(video.currentTime - want) > 0.12 && !video.seeking) video.currentTime = want;
+      if (Math.abs(video.currentTime - ph) > 0.12 && !video.seeking) video.currentTime = ph;
     } else {
-      video.playbackRate = clamp(r.c.speed, 0.25, 4);
-      if (moved || Math.abs(video.currentTime - want) > 0.25) { if (!video.seeking) video.currentTime = want; }
-      if (video.paused && t >= voice.from) video.play().catch(() => {});
+      video.playbackRate = clamp(c.speed, 0.25, 4);
+      if (Math.abs(video.currentTime - ph) > 0.25 && !video.seeking) video.currentTime = ph;
+      if (video.paused) video.play().catch(() => {});
     }
   }
-  if (t > view.e) setView(t - (view.e - view.s) * 0.1, view.e - view.s);
-  $("#phOut").textContent = fmt(t);
+  if (ph > view.e) setView(ph - (view.e - view.s) * 0.1, view.e - view.s);
+  $("#phOut").textContent = fmt(ph);
   place();
   requestAnimationFrame(tick);
 }
@@ -935,7 +928,7 @@ function finish() {
   const v = voice;
   voice = null;
   video.pause();
-  setPh(v.mode === "clip" ? v.from : v.to);
+  setPh(v.mode === "clip" ? v.c.in : v.to);
   setButtons();
 }
 function halt() {
@@ -943,66 +936,47 @@ function halt() {
   if (!voice) return;
   const v = voice;
   voice = null;
-  for (const n of v.nodes) { try { n.stop(); } catch {} }
+  try { v.node.stop(); } catch {}
   video.pause();
   setPh(ph);
   setButtons();
 }
-const togglePlay = () => { if (voice) halt(); else play(ph >= total - 0.01 ? 0 : ph, total, "free"); };
-function playClip() {
-  const c = only() || (at(ph) || {}).c;
-  if (!c) return;
-  const r = rowOf(c);
-  play(r.start, r.start + r.len, "clip");
-}
+const togglePlay = () => { if (voice) halt(); else playFree(); };
 const toggleClip = () => { if (voice && voice.mode === "clip") halt(); else playClip(); };
 
 $("#playBtn").onclick = togglePlay;
 $("#playClipBtn").onclick = toggleClip;
 $("#player").onclick = togglePlay;
 
-/* --- the timeline by hand --- */
+/* --- the waveform by hand --- */
 let drag = null;
 let lastTap = { at: 0, x: 0 };
 
-function snap(t, e, withPlayhead = true) {
+function snap(t, e, skip) {
   if (!snapOn || e.ctrlKey || e.metaKey) return t;
   const reach = 7 / pps();
   let best = t, d = reach;
   const test = (v) => { const g = Math.abs(v - t); if (g < d) { d = g; best = v; } };
-  for (const r of layout) { test(r.start); test(r.start + r.len); }
+  for (const c of clips) if (c !== skip) { test(c.in); test(c.out); }
   for (const m of markers) test(m);
-  if (withPlayhead) test(ph);
+  if (skip !== undefined) test(ph);
   return best;
 }
-function trimTo(e) {
-  const d = drag, c = d.c, t = snap(timeAt(e.clientX), e);
-  if (d.kind === "trimEnd") {
-    const go = Math.max(MIN_CLIP / c.speed, t - d.start - (clipLength(c) - playLength(c))) * c.speed;
-    if (c.reverse) c.in = clamp(c.out - go, 0, c.out - MIN_CLIP);
-    else c.out = clamp(c.in + go, c.in + MIN_CLIP, S.dur);
-    showSource(c, playLength(c));
-  } else {
-    const shift = (t - d.start) * c.speed;
-    if (c.reverse) c.out = clamp(d.out0 - shift, c.in + MIN_CLIP, S.dur);
-    else c.in = clamp(d.in0 + shift, 0, c.out - MIN_CLIP);
-    pin = { id: c.id, dt: Math.max(0, (c.reverse ? d.out0 - c.out : c.in - d.in0) / c.speed) };
-    showSource(c, 0);
-  }
-  relayout();
-  syncAll();
-}
-const showSource = (c, u) => seekVideo(sourceAt(c, u));
-
 function dragTo(e) {
-  if (drag.kind === "scrub") setPh(snap(timeAt(e.clientX), e, false));
-  else if (drag.kind === "clip") {
-    const t = timeAt(e.clientX);
-    let i = layout.findIndex((r) => t < r.start + r.len / 2);
-    drag.insert = i < 0 ? layout.length : i;
-    queueDraw();
-  } else trimTo(e);
+  const d = drag, t = timeAt(e.clientX);
+  if (d.kind === "scrub") setPh(snap(t, e));
+  else if (d.kind === "paint") {
+    const b = snap(t, e, draftOf() || null), lo = Math.min(d.anchor, b), hi = Math.max(d.anchor, b);
+    if (hi - lo >= MIN_CLIP) { setDraft(lo, hi); seekVideo(b); syncAll(); }
+  } else if (d.kind === "start") {
+    d.c.in = clamp(snap(t, e, d.c), 0, d.c.out - MIN_CLIP);
+    seekVideo(d.c.in); syncAll();
+  } else {
+    d.c.out = clamp(snap(t, e, d.c), d.c.in + MIN_CLIP, S.dur);
+    seekVideo(d.c.out); syncAll();
+  }
 }
+// holding past the edge walks the view along
 function edgeWalk() {
   if (!drag) return;
   const box = mainBox.getBoundingClientRect(), span = view.e - view.s;
@@ -1034,53 +1008,50 @@ function endDrag(e) {
   cancelAnimationFrame(d.raf);
   d.el.classList.remove("drag");
   drag = null;
-  pin = null;
 
-  if (d.kind === "clip") {
-    if (!d.moved) {
-      if (!(e.ctrlKey || e.metaKey || e.shiftKey)) select([d.id]);
-      const again = e.timeStamp - lastTap.at < 350 && Math.abs(e.clientX - lastTap.x) < 8;
-      lastTap = again ? { at: 0, x: 0 } : { at: e.timeStamp, x: e.clientX };
-      if (again) isolate(timeAt(e.clientX)); else setPh(timeAt(e.clientX));
-      return;
-    }
-    if (!selected.has(d.id)) selected = new Set([d.id]);
-    const moving = picks(), head = clips.slice(0, d.insert).filter((c) => !selected.has(c.id));
-    const rest = clips.filter((c) => !selected.has(c.id));
-    commit("Clip moved.", () => { rest.splice(head.length, 0, ...moving); clips = rest; });
+  if (d.kind === "scrub") return;
+  if (d.kind === "paint" && !d.moved) {
+    const t = timeAt(e.clientX);
+    const again = e.timeStamp - lastTap.at < 350 && Math.abs(e.clientX - lastTap.x) < 8;
+    lastTap = again ? { at: 0, x: 0 } : { at: e.timeStamp, x: e.clientX };
+    if (again) return pickSound(t);
+    const c = clipAt(t);
+    if (e.ctrlKey || e.metaKey || e.shiftKey) { if (c) pick(c.id, e); }
+    else select(c ? [c.id] : []);
+    setPh(t);
     return;
   }
-  if (d.kind === "scrub") return;
-  if (d.moved) {
-    past.push(d.before); future = [];
-    settle("Trimmed.");
-    setPh(rowOf(d.c).start + (d.kind === "trimEnd" ? playLength(d.c) : 0));
+  if (!d.moved) return;
+  past.push(d.before); future = [];
+  if (d.kind === "paint") {
+    const c = only();
+    settle(touch ? "Selected. Tap Extract Audio, or drag again to replace it." : "Selected. Press E to extract it, or drag again to replace it.");
+    select([c.id]);
+    setPh(c.in);
+    return;
   }
+  settle("Trimmed.");
+  setPh(d.kind === "start" ? d.c.in : d.c.out);
 }
 mainBox.addEventListener("pointerdown", (e) => {
   if (e.button !== 0 || e.target.closest(".handle")) return;
   const y = e.clientY - mainBox.getBoundingClientRect().top;
-  const t = timeAt(e.clientX), r = y >= RULER ? at(t) : null;
-  if (!r) {
-    if (y >= RULER) select([]);
+  if (y < waveTop) {
     beginDrag(e, { kind: "scrub" });
-    setPh(snap(t, e, false));
+    setPh(snap(timeAt(e.clientX), e));
     return;
   }
-  if (e.ctrlKey || e.metaKey || e.shiftKey) pick(r.c.id, e);
-  else if (!selected.has(r.c.id)) select([r.c.id]);
-  beginDrag(e, { kind: "clip", id: r.c.id, insert: layout.indexOf(r) });
+  beginDrag(e, { kind: "paint", anchor: snap(timeAt(e.clientX), e, draftOf() || null) });
 });
 mainBox.addEventListener("pointermove", moveDrag);
 mainBox.addEventListener("pointerup", endDrag);
 mainBox.addEventListener("pointercancel", endDrag);
 
-for (const [el, kind] of [[$("#hStart"), "trimStart"], [$("#hEnd"), "trimEnd"]]) {
+for (const [el, kind, key] of [[$("#hStart"), "start", "in"], [$("#hEnd"), "end", "out"]]) {
   el.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;
     e.stopPropagation();
-    const c = only(), r = rowOf(c);
-    beginDrag(e, { kind, c, start: r.start, in0: c.in, out0: c.out });
+    beginDrag(e, { kind, c: only() });
   });
   el.addEventListener("pointermove", moveDrag);
   el.addEventListener("pointerup", endDrag);
@@ -1092,10 +1063,11 @@ for (const [el, kind] of [[$("#hStart"), "trimStart"], [$("#hEnd"), "trimEnd"]])
     e.preventDefault(); e.stopPropagation();
     const c = only();
     commit(null, () => {
-      const startSide = (kind === "trimStart") !== c.reverse;
-      if (startSide) c.in = clamp(c.in + move, 0, c.out - MIN_CLIP);
+      if (key === "in") c.in = clamp(c.in + move, 0, c.out - MIN_CLIP);
       else c.out = clamp(c.out + move, c.in + MIN_CLIP, S.dur);
     });
+    seekVideo(c[key]);
+    keepInView(c[key]);
   });
 }
 
@@ -1113,7 +1085,7 @@ mainBox.addEventListener("wheel", wheel, { passive: false });
 let overDrag = false;
 function overMove(e) {
   const box = overBox.getBoundingClientRect(), span = view.e - view.s;
-  setView(clamp((e.clientX - box.left) / box.width, 0, 1) * total - span / 2, span);
+  setView(clamp((e.clientX - box.left) / box.width, 0, 1) * S.dur - span / 2, span);
 }
 overBox.addEventListener("pointerdown", (e) => { overDrag = true; overBox.setPointerCapture(e.pointerId); overMove(e); });
 overBox.addEventListener("pointermove", (e) => { if (overDrag) overMove(e); });
@@ -1142,19 +1114,21 @@ addEventListener("keydown", (e) => {
     "=": () => zoomAt(clamp(ph, view.s, view.e), 0.6),
     "+": () => zoomAt(clamp(ph, view.s, view.e), 0.6),
     "-": () => zoomAt(clamp(ph, view.s, view.e), 1.6),
-  }[key] : e.altKey ? { arrowleft: () => nudge(-1), arrowright: () => nudge(1) }[key] : {
+  }[key] : e.altKey ? { arrowup: () => nudge(-1), arrowdown: () => nudge(1) }[key] : {
     " ": togglePlay,
     s: toggleClip,
-    q: trimLeft,
-    w: trimRight,
+    i: () => setEdge("in"),
+    o: () => setEdge("out"),
+    q: () => setEdge("in"),
+    w: () => setEdge("out"),
     delete: remove,
     backspace: remove,
     m: marker,
     n: toggleSnap,
-    e: () => askExport(),
-    z: () => (e.shiftKey ? fit() : zoomToClip()),
+    e: () => (only() ? askExtract() : askAll()),
+    z: () => (e.shiftKey ? fit() : zoomToSel()),
     home: () => { setPh(0); keepInView(0); },
-    end: () => { setPh(total); keepInView(total); },
+    end: () => { setPh(S.dur); keepInView(S.dur); },
     arrowup: () => jump(-1),
     arrowdown: () => jump(1),
     arrowleft: () => { setPh(ph - (e.shiftKey ? 1 : 1 / 30)); keepInView(ph); },
@@ -1164,21 +1138,20 @@ addEventListener("keydown", (e) => {
   if (go) { e.preventDefault(); go(); }
 });
 
-/* --- auto split --- */
+/* --- auto split: marks every sound, and never touches a clip you already have --- */
 const autoDlg = $("#autoDlg");
 const autoOpts = () => ({ quiet: +$("#autoQuiet").value, gap: +$("#autoGap").value / 1000 });
-const autoScope = () => (selected.size && selected.size < clips.length ? picks() : clips).filter((c) => !c.reverse);
-function autoCount() {
-  const opts = autoOpts();
-  return autoScope().reduce((n, c) => n + Sound.sounds(S, c.in, c.out, opts).length, 0);
+function autoFound() {
+  const kept = clips.filter((c) => !c.draft);
+  return Sound.sounds(S, 0, S.dur, autoOpts()).filter((f) => !kept.some((c) => c.in < f.e && c.out > f.s));
 }
 function autoShow() {
   $("#autoQuietOut").textContent = `${$("#autoQuiet").value} dB`;
   $("#autoGapOut").textContent = `${$("#autoGap").value} ms`;
-  const n = autoCount();
-  $("#autoHint").textContent = n ? (n === 1 ? "Finds 1 sound." : `Finds ${n} sounds.`) : "Nothing found. Move Quiet Below lower.";
+  const n = autoFound().length;
+  $("#autoHint").textContent = n ? (n === 1 ? "Finds 1 sound." : `Finds ${n} sounds.`) : "Nothing new found. Move Quiet Below lower.";
   $("#autoGo").disabled = !n;
-  $("#autoGo").textContent = n ? `Split Into ${n} Clips` : "Split";
+  $("#autoGo").textContent = n ? `Mark ${n} Sounds` : "Mark";
 }
 $("#autoBtn").onclick = () => {
   halt();
@@ -1193,39 +1166,29 @@ $("#autoGap").addEventListener("input", autoShow);
 $("#autoCancel").onclick = () => autoDlg.close();
 $("#autoForm").addEventListener("submit", (e) => {
   e.preventDefault();
-  const opts = autoOpts(), drop = $("#autoDrop").checked, scope = new Set(autoScope());
-  const stem = Sound.cleanName($("#autoPrefix").value) || "sfx";
-  let n = 0;
-  const label = () => `${stem}_${String(++n).padStart(3, "0")}`;
+  const found = autoFound(), stem = Sound.cleanName($("#autoPrefix").value) || "sfx";
   commit(null, () => {
-    const out = [];
-    for (const c of clips) {
-      const found = scope.has(c) ? Sound.sounds(S, c.in, c.out, opts) : [];
-      if (!found.length) { out.push(c); continue; }
-      if (drop) {
-        for (const f of found) out.push(newClip(f.s, f.e, label(), { ...c, fadeIn: 0, fadeOut: 0 }));
-      } else {
-        // keep everything, and cut halfway through each silence
-        found.forEach((f, i) => {
-          const a = i ? (found[i - 1].e + f.s) / 2 : c.in, b = i < found.length - 1 ? (f.e + found[i + 1].s) / 2 : c.out;
-          out.push(newClip(a, b, label(), { ...c, fadeIn: 0, fadeOut: 0 }));
-        });
-      }
+    clips = clips.filter((c) => !c.draft);
+    const made = [];
+    for (const f of found) {
+      const c = newClip(f.s, f.e, nextName(`${stem}_000`, made), {});
+      made.push(c);
+      placeByTime(c);
     }
-    clips = out;
     selected = new Set(clips.length ? [clips[0].id] : []);
+    lastName = made[made.length - 1].name;
   });
   autoDlg.close();
-  ph = 0;
   fit();
-  setPh(0);
-  say(`${n} clips. Name one, press Enter, and the next one plays.`);
+  if (clips[0]) setPh(clips[0].in);
+  say(`${found.length} sounds marked. Name one, press Enter, and the next one plays.`);
   showTab(tabs[0]);
   drawOver();
 });
 
-/* --- export --- */
+/* --- extract and export --- */
 const exportDlg = $("#exportDlg"), exName = $("#exName"), exHint = $("#exHint");
+let extracting = null;   // the one clip being extracted, or null when exporting several
 const remember = {
   get() { try { return localStorage.getItem("audio-cut-format"); } catch { return null; } },
   set(v) { try { localStorage.setItem("audio-cut-format", v); } catch {} },
@@ -1234,36 +1197,55 @@ const mp3Radio = document.querySelector('input[name="fmt"][value="mp3"]');
 if (!window.lamejs) mp3Radio.disabled = true;
 else if (remember.get() === "mp3") mp3Radio.checked = true;
 const modeEach = () => document.querySelector('input[name="exmode"]:checked').value === "each";
-const exportRows = () => ($("#exSel").checked ? layout.filter((r) => selected.has(r.c.id)) : layout);
+const chosenFormat = () => document.querySelector('input[name="fmt"]:checked').value;
+const exportRows = () => ($("#exSel").checked ? picks() : clips);
 
 function exportShow() {
+  const format = chosenFormat();
+  if (extracting) {
+    $("#exTitle").textContent = "Name this clip";
+    $("#exMode").hidden = true;
+    $("#exSelRow").hidden = true;
+    exHint.className = "hint"; exHint.textContent = "";
+    $("#exSave").textContent = `Download .${format}`;
+    return;
+  }
   const rows = exportRows(), many = rows.length > 1, each = many && modeEach();
+  $("#exTitle").textContent = "Export audio";
   $("#exMode").hidden = !many;
-  exName.hidden = false;
   exName.setAttribute("aria-label", each ? "Folder name" : "File name");
-  const fmt = document.querySelector('input[name="fmt"]:checked').value;
   exHint.className = "hint";
-  exHint.textContent = each ? `${rows.length} clips in one .zip, each with its own name.` : many ? `${rows.length} clips joined in order.` : "";
+  exHint.textContent = !rows.length ? "No clips yet, so this exports the whole recording." : each ? `${rows.length} clips in one .zip, each with its own name.` : many ? `${rows.length} clips joined in list order.` : "";
   $("#exSelRow").hidden = !selected.size || selected.size === clips.length;
   $("#exSelText").textContent = selected.size === 1 ? "Only the Selected Clip" : `Only the ${selected.size} Selected Clips`;
-  $("#exSave").textContent = each ? "Download .zip" : `Download .${fmt}`;
+  $("#exSave").textContent = each ? "Download .zip" : `Download .${format}`;
 }
-function askExport() {
-  if (!clips.length) return;
+function askExtract() {
+  const c = only();
+  if (!c) return;
   halt();
-  $("#exSel").checked = selected.size > 0 && selected.size < clips.length;
-  const one = only();
-  exName.value = $("#exSel").checked && one ? one.name : S.file.name.replace(/\.\w+$/, "");
+  extracting = c;
+  exName.value = c.name;
   exportShow();
   exportDlg.showModal();
   exName.select();
 }
-$("#exportBtn").onclick = askExport;
+function askAll() {
+  halt();
+  extracting = null;
+  $("#exSel").checked = selected.size > 1 && selected.size < clips.length;
+  exName.value = S.file.name.replace(/\.\w+$/, "");
+  exportShow();
+  exportDlg.showModal();
+  exName.select();
+}
+$("#extractBtn").onclick = askExtract;
+$("#exportBtn").onclick = askAll;
 $("#exCancel").onclick = () => exportDlg.close();
 $("#exSel").addEventListener("change", exportShow);
 for (const r of document.querySelectorAll('#exportForm input[type="radio"]')) r.addEventListener("change", exportShow);
 exportDlg.addEventListener("cancel", (e) => { if ($("#exSave").disabled) e.preventDefault(); });
-exName.addEventListener("input", exportShow);
+exName.addEventListener("input", () => { if (!extracting) exportShow(); else { exHint.textContent = ""; exHint.className = "hint"; } });
 
 function saveBlob(blob, name) {
   const url = URL.createObjectURL(blob), a = document.createElement("a");
@@ -1272,27 +1254,27 @@ function saveBlob(blob, name) {
   setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 const encode = (format, chans) => (format === "mp3" ? Sound.mp3(chans) : Sound.wav(chans));
+const mime = (format) => (format === "mp3" ? "audio/mpeg" : "audio/wav");
 
 $("#exportForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const base = Sound.cleanName(exName.value);
   if (!base) { exHint.textContent = "Type a name first."; exHint.className = "hint bad"; exName.focus(); return; }
-  const format = document.querySelector('input[name="fmt"]:checked').value;
-  const rows = exportRows(), each = rows.length > 1 && modeEach();
-  const save = $("#exSave"), cancel = $("#exCancel");
+  const format = chosenFormat(), save = $("#exSave"), cancel = $("#exCancel");
   save.disabled = cancel.disabled = true;
   exHint.textContent = "Making the file…"; exHint.className = "hint";
   await new Promise((r) => setTimeout(r));
   try {
-    let name;
-    if (each) {
+    let name, rows = extracting ? [extracting] : exportRows();
+    if (!rows.length) rows = [newClip(0, S.dur, base, {})];
+    if (rows.length > 1 && modeEach() && !extracting) {
       const entries = [], used = new Set();
       for (let i = 0; i < rows.length; i++) {
         exHint.textContent = `Making clip ${i + 1} of ${rows.length}…`;
         await new Promise((r) => setTimeout(r));
-        const sound = await Sound.render(S, rows[i].c);
-        let label = rows[i].c.name, n = 2;
-        while (used.has(label)) label = `${rows[i].c.name}_${n++}`;
+        const sound = await Sound.render(S, rows[i]);
+        let label = rows[i].name, n = 2;
+        while (used.has(label)) label = `${rows[i].name}_${n++}`;
         used.add(label);
         entries.push({ name: `${label}.${format}`, data: await encode(format, Sound.channelsOf([sound])) });
       }
@@ -1300,14 +1282,19 @@ $("#exportForm").addEventListener("submit", async (e) => {
       saveBlob(Sound.zip(entries), name);
     } else {
       const sounds = [];
-      for (const r of rows) sounds.push(await Sound.render(S, r.c));
+      for (const c of rows) sounds.push(await Sound.render(S, c));
       const bytes = await encode(format, Sound.channelsOf(sounds));
       name = `${base}.${format}`;
-      saveBlob(new Blob([bytes], { type: format === "mp3" ? "audio/mpeg" : "audio/wav" }), name);
+      saveBlob(new Blob([bytes], { type: mime(format) }), name);
     }
     remember.set(format);
+    const done = extracting;
     exportDlg.close();
-    say(`Downloaded ${name}.`);
+    if (done) {
+      commit(null, () => { done.name = base; done.draft = false; });
+      lastName = base;
+    }
+    say(done ? `Downloaded ${name}. Drag across the next sound.` : `Downloaded ${name}.`);
   } catch (err) {
     exHint.textContent = "That file could not be made. Try the other format.";
     exHint.className = "hint bad";
